@@ -24,8 +24,11 @@ tar -zcf - nextcloud | split -d -b 20G - $backupDir/nextcloud-${startTime_s}/nex
 echo nextcloud-${startTime_s} '打包成功'
 docker exec --user www-data -i nextcloud php occ maintenance:mode --off
 
+# startTime_s=123
 cd /home/yangn0/aliyunpan/
 backup_dir=$backupDir/nextcloud-${startTime_s}
+echo backup_dir: $backup_dir
+./aliyunpan mkdir /NASbackups/nextcloudBackups/nextcloud-${startTime_s}
 for file in `ls $backup_dir`
   do
     ./aliyunpan upload ${backup_dir}/$file /NASbackups/nextcloudBackups/nextcloud-${startTime_s}
