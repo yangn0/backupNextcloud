@@ -24,6 +24,18 @@ tar -zcf - nextcloud | split -d -b 20G - $backupDir/nextcloud-${startTime_s}/nex
 echo nextcloud-${startTime_s} '打包成功'
 docker exec --user www-data -i nextcloud php occ maintenance:mode --off
 
+# --verbose
+# delete old backups in aliyunpan
+cd /home/yangn0/aliyunpan/
+./aliyunpan drive 99819931
+./aliyunpan cd /NASbackups/nextcloudBackups
+if (($(./aliyunpan l --name -asc | grep -o  " nextcloud-[0-9]*"| wc -l) >= 2))
+then
+    file_array=($(./aliyunpan l --name -asc | grep -o  " nextcloud-[0-9]*"))
+    ./aliyunpan rm ${file_array[0]}
+fi
+./aliyunpan recycle d --all
+
 # startTime_s=123
 cd /home/yangn0/aliyunpan/
 backup_dir=$backupDir/nextcloud-${startTime_s}
@@ -33,18 +45,6 @@ for file in `ls $backup_dir`
   do
     ./aliyunpan upload ${backup_dir}/$file /NASbackups/nextcloudBackups/nextcloud-${startTime_s}
   done
-
-# --verbose
-# delete old backups in aliyunpan
-cd /home/yangn0/aliyunpan/
-# ./aliyunpan recycle d --all
-./aliyunpan drive 99819931
-./aliyunpan cd /NASbackups/nextcloudBackups
-if (($(./aliyunpan l --name -asc | grep -o  " nextcloud-[0-9]*"| wc -l) >= 3))
-then
-    file_array=($(./aliyunpan l --name -asc | grep -o  " nextcloud-[0-9]*"))
-    ./aliyunpan rm ${file_array[0]}
-fi
 
 endTime=`date`
 endTime_s=`date +%s`
