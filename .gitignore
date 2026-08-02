@@ -1,0 +1,3 @@
+# 备份日志与 logrotate 状态文件不入库
+backupNextcloud.log*
+.logrotate.state
