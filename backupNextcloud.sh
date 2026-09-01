@@ -69,10 +69,11 @@ prune_remote() {
 sync_second_copy() {
   [ -n "$SECOND_BACKUP_DIR" ] || return 0
   mkdir -p "$SECOND_BACKUP_DIR" || { log "警告: 无法创建 $SECOND_BACKUP_DIR，第二份本地备份跳过"; return 0; }
+  # disk500G 只装得下一份，先删旧释放空间再同步；主备份在 disk1T，云端另有备份兜底
+  prune_local "$SECOND_BACKUP_DIR" 0
   log "同步最新快照到 $SECOND_BACKUP_DIR/nextcloud-$startTime_s ..."
   if rsync -a --delete "$SNAP/" "$SECOND_BACKUP_DIR/nextcloud-$startTime_s/"; then
     printf '%s\n' "备份时间: $startTime" > "$SECOND_BACKUP_DIR/nextcloud-$startTime_s/.backup-time"
-    prune_local "$SECOND_BACKUP_DIR" 1
   else
     log "警告: 同步到 $SECOND_BACKUP_DIR 失败，本次没有第二份本地备份"
   fi
