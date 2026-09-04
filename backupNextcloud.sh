@@ -27,7 +27,7 @@ KEEP_REMOTE=2                                   # 阿里云盘保留的备份份
 UPLOAD_CONCURRENCY=10                           # 上传并发数（工具上限 20，路由器统一限速）
 DB_CONTAINER=                                   # 留空则自动取 config.php 中的 dbhost
 INCLUDE_DATA=${INCLUDE_DATA:-1}                 # 1=备份 data；0=测试模式（跳过 data，且不清理旧备份）
-KEEP_LOGS=6                                     # 备份日志保留次数（与 logrotate.conf 的 rotate 一致）
+KEEP_LOGS=1                                     # 备份日志保留次数（与 logrotate.conf 的 rotate 一致）
 LOG_ROTATE_CONF=/home/yangn0/backup/logrotate.conf
 LOG_STATE=/home/yangn0/backup/.logrotate.state
 
