@@ -9,6 +9,8 @@
 #   4. 上传走阿里云盘"秒传"：未变化文件不消耗带宽，只传实际变化的文件
 #   5. 上传并发调低，降低峰值带宽，降低被运营商限速的风险
 #   6. 新备份上传成功后才清理旧备份，失败时旧备份完整保留
+#   7. 上传的逐文件输出单独归档到 full/，主日志只留关键行
+#      （10 万个文件会产生 70 万行，不分离的话主日志会涨到 140MB）
 # =====================================================================
 
 set -u
@@ -30,6 +32,9 @@ INCLUDE_DATA=${INCLUDE_DATA:-1}                 # 1=备份 data；0=测试模式
 KEEP_LOGS=1                                     # 备份日志保留次数（与 logrotate.conf 的 rotate 一致）
 LOG_ROTATE_CONF=/home/yangn0/backup/logrotate.conf
 LOG_STATE=/home/yangn0/backup/.logrotate.state
+FULL_LOG_DIR=/home/yangn0/backup/full           # 上传逐文件详细日志目录（压缩归档）
+KEEP_FULL_LOGS=2                                # 详细日志保留份数
+FULL_LOG=""                                     # 本次运行的详细日志路径（运行时填充）
 
 log()  { echo "[$(date '+%F %T')] $*"; }
 fail() { log "错误: $*"; exit 1; }
@@ -62,6 +67,43 @@ prune_remote() {
     log "已删除云端旧备份: $oldest"
     names=$(printf '%s\n' "$names" | grep -v "^$oldest$")
     count=$((count - 1))
+  done
+}
+
+# ---------------------------------------------------------------------
+# 上传日志过滤
+# aliyunpan 会为每个文件打印 7 行进度（加入队列/SHA/秒传/结果），
+# 10 万个文件就是 70 万行、约 140MB，会把真正的问题彻底淹没。
+# 这些逐文件的行只写进完整日志（见 FULL_LOG），主日志里全部剔除。
+# 采用"黑名单"而不是"白名单"：不认识的输出一律保留，
+# 这样将来工具新增报错信息时不会被静默丢掉。
+# ---------------------------------------------------------------------
+UPLOAD_FILTER='
+/^\[[0-9]+\] 加入上传队列:/ {next}
+/^\[[0-9]+\] [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9:]+ (准备上传|正在计算文件SHA|检测秒传中|秒传成功|秒传失败，开始正常上传文件|正在检测和创建云盘文件夹|文件上传结果： 成功|上传文件成功, 保存到网盘路径)/ {next}
+/^[[:space:]]*正在检测和创建云盘文件夹/ {next}
+/^[[:space:]]*$/ {next}
+{print}
+'
+
+# 压缩本次上传详细日志，并只保留最近 KEEP_FULL_LOGS 份
+rotate_full_logs() {
+  [ -n "${FULL_LOG:-}" ] && [ "$FULL_LOG" != /dev/null ] || return 0
+  if [ ! -f "$FULL_LOG" ]; then
+    return 0
+  fi
+  if [ ! -s "$FULL_LOG" ]; then
+    rm -f "$FULL_LOG"
+    return 0
+  fi
+  if ! gzip -f "$FULL_LOG"; then
+    log "警告: 压缩详细日志失败，保留原文件: $FULL_LOG"
+    return 0
+  fi
+  log "上传详细日志已归档: $FULL_LOG.gz ($(du -h "$FULL_LOG.gz" | cut -f1))"
+  local keep=${KEEP_FULL_LOGS:-2}
+  ls -1t "$FULL_LOG_DIR"/backup-*.log.gz 2>/dev/null | tail -n +$((keep + 1)) | while read -r f; do
+    rm -f "$f" && log "已删除旧详细日志: $f"
   done
 }
 
@@ -104,7 +146,12 @@ log "数据库: $DB_CONTAINER / $DB_NAME"
 
 # 2. 开启维护模式；脚本退出（无论成功失败）都会尝试关闭
 docker exec --user www-data -i nextcloud php occ maintenance:mode --on >/dev/null 2>&1 || fail "开启维护模式失败"
-trap 'docker exec --user www-data -i nextcloud php occ maintenance:mode --off >/dev/null 2>&1 || true' EXIT
+# 退出时恢复维护模式；同时归档上传详细日志（中途 fail 退出时也要归档，避免留下上 GB 的裸日志）
+cleanup() {
+  docker exec --user www-data -i nextcloud php occ maintenance:mode --off >/dev/null 2>&1 || true
+  rotate_full_logs
+}
+trap cleanup EXIT
 log "维护模式已开启"
 
 # 3. 本地快照（排除可再生日录；未变化文件硬链接到上一份）
@@ -146,7 +193,20 @@ cd "$ALIYUNPAN_DIR" || fail "无法进入 $ALIYUNPAN_DIR"
 "$ALIYUNPAN" mkdir "$REMOTE_BASE" >/dev/null 2>&1 || true
 "$ALIYUNPAN" mkdir "$REMOTE_SNAP" >/dev/null 2>&1 || fail "创建云端目录 $REMOTE_SNAP 失败"
 log "开始上传（并发 $UPLOAD_CONCURRENCY，首次会传全量，之后只传变化文件）..."
-"$ALIYUNPAN" upload -p "$UPLOAD_CONCURRENCY" -np --timeout 60 --retry 3 "${SOURCES[@]}" "$REMOTE_SNAP" || fail "上传失败"
+if mkdir -p "$FULL_LOG_DIR" 2>/dev/null; then
+  FULL_LOG="$FULL_LOG_DIR/backup-$startTime_s.log"
+  log "逐文件详细输出: $FULL_LOG（备份结束后自动压缩归档）"
+else
+  FULL_LOG=/dev/null
+  log "警告: 无法创建 $FULL_LOG_DIR，本次不保留逐文件详细日志"
+fi
+
+# 完整输出写进 FULL_LOG，主日志只保留 UPLOAD_FILTER 过滤后的关键行
+"$ALIYUNPAN" upload -p "$UPLOAD_CONCURRENCY" -np --timeout 60 --retry 3 "${SOURCES[@]}" "$REMOTE_SNAP" 2>&1 \
+  | tee "$FULL_LOG" \
+  | awk "$UPLOAD_FILTER"
+UPLOAD_RC=${PIPESTATUS[0]}
+[ "$UPLOAD_RC" -eq 0 ] || fail "上传失败（退出码 $UPLOAD_RC），逐文件详细输出将归档为 $FULL_LOG.gz"
 
 # 7. 校验云端目录结构（不通过则不清理旧备份）
 UPLOAD_OK=1
