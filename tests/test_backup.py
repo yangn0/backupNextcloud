@@ -1,6 +1,7 @@
 """Verify that upload and verification failures cannot trigger backup pruning."""
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -120,6 +121,90 @@ prune_remote 2
 ''')
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(events, "lsf\n")
+
+
+class SecondCopyTests(unittest.TestCase):
+    def sync(self, root, timestamp, fail=False):
+        code = r'''
+source "$SCRIPT"
+SECOND_BACKUP_DIR="$TEST_ROOT/second"
+SNAP="$TEST_ROOT/source"
+startTime_s=$TEST_TIMESTAMP
+startTime="test-$TEST_TIMESTAMP"
+KEEP_DISK500G=2
+if [ "$TEST_FAIL" = 1 ]; then
+  rsync() { command rsync "$@"; return 23; }
+fi
+sync_second_copy
+'''
+        result = subprocess.run(
+            ["bash", "-c", code], text=True, capture_output=True,
+            env={**os.environ, "SCRIPT": str(SCRIPT), "TEST_ROOT": str(root),
+                 "TEST_TIMESTAMP": str(timestamp), "TEST_FAIL": str(int(fail))},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
+
+    def fixture(self, root):
+        source = root / "source"
+        source.mkdir()
+        (source / "unchanged").write_text("shared data")
+        os.link(source / "unchanged", source / "alias")
+        (source / "changed").write_text("original")
+        (source / ".backup-time").write_text("source marker must not be linked")
+        return source, root / "second"
+
+    def test_reuses_inodes_and_preserves_previous_contents(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, second = self.fixture(root)
+            self.sync(root, 100)
+            (source / "changed").write_text("replacement content")
+            self.sync(root, 200)
+            old, new = second / "nextcloud-100", second / "nextcloud-200"
+            self.assertEqual((old / "unchanged").stat().st_ino,
+                             (new / "unchanged").stat().st_ino)
+            self.assertEqual((new / "unchanged").stat().st_ino,
+                             (new / "alias").stat().st_ino)
+            self.assertNotEqual((source / "unchanged").stat().st_ino,
+                                (new / "unchanged").stat().st_ino)
+            self.assertEqual((old / "changed").read_text(), "original")
+            self.assertEqual((new / "changed").read_text(), "replacement content")
+            self.assertEqual((old / ".backup-time").read_text(), "备份时间: test-100\n")
+            self.assertEqual((new / ".backup-time").read_text(), "备份时间: test-200\n")
+
+    def test_success_retains_two_completed_copies_and_ignores_incomplete(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, second = self.fixture(root)
+            self.sync(root, 100)
+            self.sync(root, 200)
+            incomplete = second / "nextcloud-250"
+            incomplete.mkdir()
+            shutil.copy2(source / "unchanged", incomplete / "unchanged")
+            self.sync(root, 300)
+            self.assertFalse((second / "nextcloud-100").exists())
+            self.assertTrue((second / "nextcloud-200/.backup-time").is_file())
+            self.assertTrue((second / "nextcloud-300/.backup-time").is_file())
+            self.assertTrue(incomplete.is_dir())
+            self.assertEqual((second / "nextcloud-200/unchanged").stat().st_ino,
+                             (second / "nextcloud-300/unchanged").stat().st_ino)
+            self.assertFalse(list(second.glob(".nextcloud-*")))
+
+    def test_partial_rsync_failure_keeps_both_previous_copies(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, second = self.fixture(root)
+            self.sync(root, 100)
+            self.sync(root, 200)
+            (source / "changed").write_text("new content before simulated failure")
+            result = self.sync(root, 300, fail=True)
+            self.assertIn("保留全部旧副本", result.stdout)
+            self.assertEqual(sorted(p.name for p in second.iterdir()),
+                             ["nextcloud-100", "nextcloud-200"])
+            for timestamp in (100, 200):
+                self.assertEqual((second / f"nextcloud-{timestamp}/changed").read_text(),
+                                 "original")
 
 
 if __name__ == "__main__":

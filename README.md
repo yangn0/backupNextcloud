@@ -8,7 +8,7 @@
 
 1. 检查 OpenList 登录和存储连通性。
 2. 开启 Nextcloud 维护模式，用 `rsync` 对 `data/`、`config/` 创建本地快照，用 `mysqldump` 导出数据库。
-3. 关闭维护模式，用 `rsync` 将快照复制到第二块本地盘。
+3. 关闭维护模式，用 `rsync --link-dest` 将快照复制到第二块本地盘，复用该盘上一份副本。
 4. 用 `rclone copy` 通过 OpenList 上传快照，再用 `rclone check` 核对云端路径和大小。
 5. 校验通过后清理主盘和云端旧快照，归档日志。
 
@@ -22,7 +22,9 @@ nextcloud-<timestamp>/
     └── nextcloud-db.sql.gz
 ```
 
-本地未变化的文件通过硬链接复用上一份快照。上传仍遍历整个快照，
+两块本地盘分别通过硬链接复用各自上一份快照中未变化的文件，盘间仍独立保存数据。
+第二块盘先同步到临时目录，成功后发布新副本并保留最近两份。
+上传仍遍历整个快照，
 秒传由 OpenList 的阿里云盘驱动决定；文件内容会先发送给本机 OpenList。
 
 不备份 `apps/`、`custom_apps/`，应用需另行安装；排除回收站、历史版本、
@@ -43,6 +45,7 @@ Nextcloud 容器固定命名为 `nextcloud`，其中须能执行 `php occ`；
 | `NC_ROOT` | `/home/yangn0/disk6T/nextcloud` |
 | `BACKUP_DIR` | `/home/yangn0/disk1T/nextcloudBackups` |
 | `SECOND_BACKUP_DIR` | `/home/yangn0/disk500G/nextcloudBackups`；设为空可关闭第二份本地副本 |
+| `KEEP_DISK500G` | 第二块本地盘保留最近 2 份已完成的副本 |
 | `REMOTE_BASE` | 网盘内的 `/NASbackups/nextcloudBackups` |
 | `UPLOAD_CONCURRENCY` | 10 |
 | `DB_CONTAINER` | 默认取 `config/config.php` 中的 `dbhost`；不等于容器名时需显式填写 |
@@ -119,12 +122,15 @@ INCLUDE_DATA=0 /usr/bin/flock -n /tmp/backupNextcloud.lock \
 | --- | --- |
 | 主备份盘 disk1T | 上传并校验通过后保留最近 2 份 |
 | 云端 | 上传并校验通过后保留最近 2 份；仅匹配 `nextcloud-<数字>/` 目录 |
-| 第二备份盘 disk500G | 只容纳 1 份，上传前先删旧副本再同步新副本 |
+| 第二备份盘 disk500G | 使用硬链接复用，同步成功后保留最近 2 份已完成的副本 |
 | `backupNextcloud.log.1` | 最近 1 次轮转的主日志，不压缩 |
 | `full/backup-<timestamp>.log.gz` | 最近 2 份详细上传日志 |
 
 上传、逐文件校验或日志管道失败时非零退出，保留主盘和云端旧快照。
-第二块本地盘沿用先删旧再同步的策略，同步失败时可能没有完整副本。
+第二块本地盘同步失败时保留旧副本，并清理本次临时目录；副本完成标记为 `.backup-time`。
+已有副本不会原地修改；删除旧副本只减少硬链接计数，不会删除新副本仍引用的数据。
+硬链接节省未变化文件的空间，容量取决于保留快照中文件的并集及新副本创建期间的增量，
+大量文件被替换或数据持续增长时仍可能空间不足；同步失败不会为腾空间提前删除旧副本。
 脚本退出时会尝试关闭维护模式并压缩详细日志；被强制终止或主机断电时，
 应检查 Nextcloud 维护模式是否仍开启。
 
@@ -173,8 +179,10 @@ python3 -m unittest discover -s tests -v
 git diff --check
 ```
 
-6 项自动测试使用临时目录和模拟命令，覆盖上传失败、校验失败、日志管道失败、
-连接失败以及云端清理的目录匹配和失败处理。
+自动测试使用临时目录验证上传、校验、日志管道及连接失败时的保护行为，
+以及云端清理的目录匹配和失败处理；这些测试模拟 Docker 和 WebDAV 操作。
+第二块盘的测试使用真实 rsync，检查硬链接 inode 复用、旧文件内容保留、
+两份副本保留策略，以及部分同步失败时的旧副本保护。
 
 `bash tests/openlist_smoke.sh` 会实际访问 OpenList，在备份目录下创建独立的
 `.openlist-upload-check-*` 目录，检查中文文件名、零字节文件、空目录的往返，

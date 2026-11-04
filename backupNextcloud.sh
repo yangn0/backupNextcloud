@@ -18,13 +18,14 @@ set -o pipefail
 # ---------- 配置区（按需修改） ----------
 NC_ROOT=/home/yangn0/disk6T/nextcloud           # Nextcloud 安装根目录
 BACKUP_DIR=/home/yangn0/disk1T/nextcloudBackups # 本地备份目录
-SECOND_BACKUP_DIR=/home/yangn0/disk500G/nextcloudBackups # 第二份本地备份目录（只保留最新 1 份；留空则关闭）
+SECOND_BACKUP_DIR=/home/yangn0/disk500G/nextcloudBackups # 第二份本地备份目录（留空则关闭）
 REMOTE_BASE=/NASbackups/nextcloudBackups        # 网盘中的备份目录（相对 OpenList 挂载点）
 OPENLIST_URL=${OPENLIST_URL:-http://127.0.0.1:5244/dav/}
 OPENLIST_MOUNT_PATH=${OPENLIST_MOUNT_PATH:-/opt/openlist/data} # 现有阿里云盘备份盘的挂载点
 OPENLIST_CREDENTIALS=${OPENLIST_CREDENTIALS:-/home/yangn0/openlist/admin-credentials.txt}
 RCLONE=${RCLONE:-rclone}                         # WebDAV 客户端
 KEEP_DISK1T=2                                   # /home/yangn0/disk1T 保留的备份份数
+KEEP_DISK500G=2                                 # 第二块本地盘保留的备份份数（硬链接复用）
 KEEP_REMOTE=2                                   # 阿里云盘保留的备份份数
 UPLOAD_CONCURRENCY=10                           # WebDAV 上传并发数（路由器统一限速）
 DB_CONTAINER=                                   # 留空则自动取 config.php 中的 dbhost
@@ -142,18 +143,54 @@ rotate_full_logs() {
   done
 }
 
-# 把最新快照完整复制到第二块本地盘（disk500G），并只保留最新 1 份
+# 在第二块盘内用硬链接复用上一份已完成的副本，成功后才清理旧副本。
 sync_second_copy() {
   [ -n "$SECOND_BACKUP_DIR" ] || return 0
   mkdir -p "$SECOND_BACKUP_DIR" || { log "警告: 无法创建 $SECOND_BACKUP_DIR，第二份本地备份跳过"; return 0; }
-  # disk500G 只装得下一份，先删旧释放空间再同步；主备份在 disk1T，云端另有备份兜底
-  prune_local "$SECOND_BACKUP_DIR" 0
-  log "同步最新快照到 $SECOND_BACKUP_DIR/nextcloud-$startTime_s ..."
-  if rsync -a --delete "$SNAP/" "$SECOND_BACKUP_DIR/nextcloud-$startTime_s/"; then
-    printf '%s\n' "备份时间: $startTime" > "$SECOND_BACKUP_DIR/nextcloud-$startTime_s/.backup-time"
-  else
-    log "警告: 同步到 $SECOND_BACKUP_DIR 失败，本次没有第二份本地备份"
+  local dest="$SECOND_BACKUP_DIR/nextcloud-$startTime_s" stage candidate name prev="" i remove_count
+  local -a completed=() link_args=()
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    log "警告: 第二份本地副本目录已存在，跳过以免修改已有快照: $dest"
+    return 0
   fi
+  # .backup-time 仅在同步完成后生成，避免复用或计数未完成的历史副本。
+  while IFS= read -r candidate; do
+    name=${candidate##*/}
+    [[ "$name" =~ ^nextcloud-[0-9]+$ ]] || continue
+    [ -d "$candidate" ] && [ -f "$candidate/.backup-time" ] || continue
+    completed+=("$candidate")
+    prev=$candidate
+  done < <(printf '%s\n' "$SECOND_BACKUP_DIR"/nextcloud-* | sort -V)
+  if [ -n "$prev" ]; then
+    link_args=(--link-dest="$prev")
+    log "第二块盘硬链接复用: $prev"
+  fi
+  # 临时目录与最终目录在同一块盘上；失败不发布快照，也不提前删除旧副本。
+  stage=$(mktemp -d "$SECOND_BACKUP_DIR/.nextcloud-$startTime_s.XXXXXXXX") \
+    || { log "警告: 无法创建第二份本地副本的临时目录，保留旧副本"; return 0; }
+  log "同步最新快照到 $dest ..."
+  if ! rsync -aH --delete --exclude='/.backup-time' "${link_args[@]}" "$SNAP/" "$stage/"; then
+    log "警告: 同步到 $SECOND_BACKUP_DIR 失败，保留全部旧副本"
+    rm -rf -- "$stage"
+    return 0
+  fi
+  if ! printf '%s\n' "备份时间: $startTime" > "$stage/.backup-time" || ! mv -T -- "$stage" "$dest"; then
+    log "警告: 发布第二份本地副本失败，保留全部旧副本"
+    rm -rf -- "$stage"
+    return 0
+  fi
+  completed+=("$dest")
+  remove_count=$((${#completed[@]} - KEEP_DISK500G))
+  for ((i=0; i<remove_count; i++)); do
+    candidate=${completed[i]}
+    [ "$candidate" != "$dest" ] || break
+    if rm -rf -- "$candidate"; then
+      log "已删除第二块盘旧副本: $candidate"
+    else
+      log "警告: 删除第二块盘旧副本失败，停止清理: $candidate"
+      break
+    fi
+  done
 }
 
 main() {
@@ -220,7 +257,7 @@ main() {
   docker exec --user www-data -i nextcloud php occ maintenance:mode --off >/dev/null 2>&1 || log "警告: 关闭维护模式失败"
   log "维护模式已关闭"
 
-  # 5.5 第二份本地备份（disk500G，只保留最新一份；测试模式不做，避免动到真实旧备份）
+  # 5.5 第二份本地备份（disk500G，硬链接复用并保留两份；测试模式跳过）
   if [ "$INCLUDE_DATA" -eq 1 ]; then
     sync_second_copy
   fi
