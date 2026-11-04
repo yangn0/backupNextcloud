@@ -1,6 +1,8 @@
 # 备份日志与 logrotate 状态文件不入库
 backupNextcloud.log*
-backupNextcloud.summary.txt
 .logrotate.state
 # 上传逐文件详细日志（体积大，不入库）
 full/
+# Python 测试缓存
+__pycache__/
+*.py[cod]
