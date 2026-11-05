@@ -79,6 +79,59 @@ main
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(events, "lsf\n")
 
+    def resume_workflow(self, mode):
+        return self.run_shell(r'''
+BACKUP_DIR="$TEST_ROOT/backups"
+FULL_LOG_DIR="$TEST_ROOT/logs"
+mkdir -p "$BACKUP_DIR/nextcloud-123"/{data,config,db}
+printf 'SQL dump\n' | gzip > "$BACKUP_DIR/nextcloud-123/db/nextcloud-db.sql.gz"
+configure_openlist() { REMOTE_ROOT="openlist:/test"; }
+docker() { echo docker >> "$TEST_ROOT/events"; return 99; }
+rsync() { echo rsync >> "$TEST_ROOT/events"; return 99; }
+prune_local() { echo prune_local >> "$TEST_ROOT/events"; }
+prune_remote() { echo prune_remote >> "$TEST_ROOT/events"; }
+openlist() {
+  printf '%s %s\n' "$1" "${3:-}" >> "$TEST_ROOT/events"
+  case "$1:$MODE" in
+    copy:upload_fail) return 7 ;;
+    check:check_fail) return 1 ;;
+  esac
+}
+if [ "$MODE" = broken_db ]; then
+  printf 'broken gzip\n' > "$BACKUP_DIR/nextcloud-123/db/nextcloud-db.sql.gz"
+fi
+if [ "$MODE" = invalid ]; then
+  main --resume ../123
+else
+  main --resume 123
+fi
+'''.replace('BACKUP_DIR=', f'MODE={mode}\nBACKUP_DIR=', 1))
+
+    def test_resume_uses_existing_snapshot_without_local_changes(self):
+        result, events = self.resume_workflow("success")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("copy openlist:/test/nextcloud-123", events)
+        self.assertIn("check openlist:/test/nextcloud-123", events)
+        for forbidden in ("docker", "rsync", "prune_"):
+            self.assertNotIn(forbidden, events)
+
+    def test_resume_failures_preserve_backups(self):
+        for mode in ("upload_fail", "check_fail"):
+            with self.subTest(mode=mode):
+                result, events = self.resume_workflow(mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("prune_", events)
+                self.assertNotIn("docker", events)
+                if mode == "upload_fail":
+                    self.assertNotIn("check ", events)
+
+    def test_resume_rejects_invalid_snapshot_before_remote_operations(self):
+        for mode in ("invalid", "broken_db"):
+            with self.subTest(mode=mode):
+                result, events = self.resume_workflow(mode)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(events, "")
+
     def test_prune_matches_only_snapshot_directories(self):
         result, events = self.run_shell(r'''
 REMOTE_ROOT="openlist:/test"

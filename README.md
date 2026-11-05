@@ -4,6 +4,8 @@
 脚本先创建本地文件快照并导出数据库，再将生成的快照上传到 OpenList。
 入口为 `backupNextcloud.sh`，运行期间无需调用旧的 aliyunpan 客户端。
 
+日常检查、保留策略、恢复后的收尾、云端取回和故障排查见[运维手册](docs/operations.md)。
+
 ## 备份内容和流程
 
 1. 检查 OpenList 登录和存储连通性。
@@ -47,7 +49,9 @@ Nextcloud 容器固定命名为 `nextcloud`，其中须能执行 `php occ`；
 | `SECOND_BACKUP_DIR` | `/home/yangn0/disk500G/nextcloudBackups`；设为空可关闭第二份本地副本 |
 | `KEEP_DISK500G` | 第二块本地盘保留最近 2 份已完成的副本 |
 | `REMOTE_BASE` | 网盘内的 `/NASbackups/nextcloudBackups` |
-| `UPLOAD_CONCURRENCY` | 10 |
+| `UPLOAD_CONCURRENCY` | 默认 2，可用环境变量覆盖 |
+| `CHECK_CONCURRENCY` | 目录读取和校验并发默认 2，可用环境变量覆盖 |
+| `OPENLIST_TPSLIMIT` | 每个 rclone 进程每秒最多 4 个请求，突发为 1；可用环境变量覆盖 |
 | `DB_CONTAINER` | 默认取 `config/config.php` 中的 `dbhost`；不等于容器名时需显式填写 |
 
 数据库名、用户和密码在运行时从 `config/config.php` 读取，
@@ -116,58 +120,24 @@ INCLUDE_DATA=0 /usr/bin/flock -n /tmp/backupNextcloud.lock \
 它使用相同的快照目录名格式，后续正常备份仍会将其纳入保留数量；
 恢复时应确认所选快照包含 `data/`。
 
-## 保留策略和故障排查
+### 恢复中断的上传
 
-| 位置 | 默认保留规则 |
-| --- | --- |
-| 主备份盘 disk1T | 上传并校验通过后保留最近 2 份 |
-| 云端 | 上传并校验通过后保留最近 2 份；仅匹配 `nextcloud-<数字>/` 目录 |
-| 第二备份盘 disk500G | 使用硬链接复用，同步成功后保留最近 2 份已完成的副本 |
-| `backupNextcloud.log.1` | 最近 1 次轮转的主日志，不压缩 |
-| `full/backup-<timestamp>.log.gz` | 最近 2 份详细上传日志 |
-
-上传、逐文件校验或日志管道失败时非零退出，保留主盘和云端旧快照。
-第二块本地盘同步失败时保留旧副本，并清理本次临时目录；副本完成标记为 `.backup-time`。
-已有副本不会原地修改；删除旧副本只减少硬链接计数，不会删除新副本仍引用的数据。
-硬链接节省未变化文件的空间，容量取决于保留快照中文件的并集及新副本创建期间的增量，
-大量文件被替换或数据持续增长时仍可能空间不足；同步失败不会为腾空间提前删除旧副本。
-脚本退出时会尝试关闭维护模式并压缩详细日志；被强制终止或主机断电时，
-应检查 Nextcloud 维护模式是否仍开启。
-
-主日志保留流程、错误和定期统计，逐文件成功输出写入 `full/`。
-云端清理失败会记录警告，留待后续处理；当前 OpenList 存储将删除项移入回收站。
-
-`rclone check --size-only` 检查文件是否存在、路径和大小是否一致，
-不能检测大小相同的内容损坏。主机的 rclone 1.64.2 即使指定该选项也会输出
-`No common hash found`；该提示本身不代表校验失败，以退出码及差异报告为准。
-
-登录返回 401 时检查凭据；写入返回 403 时检查上述 WebDAV 权限。
-下载返回 403 时检查挂载的 WebDAV 下载策略是否为 `native_proxy`。
-失败可能留下不完整的 `nextcloud-<timestamp>` 目录，不能仅凭目录名判断备份完整性。
-
-## 从云端取回快照
-
-先用只读连接检查命令列出目录，选择一份已完成校验的完整快照。
-以下命令只将快照下载到新的本地目录，请将示例中的 `nextcloud-<timestamp>`
-替换为实际目录名：
+上传中断后，可以复用已有完整本地快照继续上传并校验，避免重新生成快照：
 
 ```bash
-cd /home/yangn0/backup
-(
-  source ./backupNextcloud.sh
-  configure_openlist
-  snapshot='nextcloud-<timestamp>'
-  restore_dir=$(mktemp -d /tmp/nextcloud-restore.XXXXXXXX)
-  openlist copy "$REMOTE_ROOT/$snapshot" "$restore_dir/$snapshot" --create-empty-src-dirs &&
-    openlist check "$REMOTE_ROOT/$snapshot" "$restore_dir/$snapshot" --download &&
-    printf '已取回并核对内容: %s\n' "$restore_dir/$snapshot"
-)
+/usr/bin/flock -n /tmp/backupNextcloud.lock \
+  /bin/bash /home/yangn0/backup/backupNextcloud.sh --resume 1793805718 \
+  >> /home/yangn0/backup/backupNextcloud.log 2>&1
 ```
 
-下载位置需要足够空间，可将 `/tmp` 改为恢复盘上的目录。
-恢复服务还需在维护模式下还原 `config/`、`data/`，导入对应数据库，
-安装匹配的 Nextcloud 版本及应用，并核对数据目录的属主和权限。
-WebDAV 副本不保留原始 POSIX 权限和硬链接关系，优先使用本地快照恢复这些元数据。
+将时间戳替换为需要恢复的快照。恢复入口要求快照包含 `data/`、`config/`
+和有效的数据库 gzip 文件。此入口不重做本地备份、不切换维护模式，
+成功后保留全部旧快照，不轮转主日志。
+上传会跳过远端已有的相同文件；结束后仍对整个快照校验路径和大小。
+限流或临时错误的整轮重试间隔为 30 秒。
+
+**恢复上传及校验成功后，仍需完成[收尾检查](docs/operations.md#恢复后的收尾)。**
+不要仅凭退出码为 0 判断旧快照清理和主日志轮转已完成。
 
 ## 验证
 
@@ -175,12 +145,14 @@ WebDAV 副本不保留原始 POSIX 权限和硬链接关系，优先使用本地
 
 ```bash
 bash -n backupNextcloud.sh tests/openlist_smoke.sh
-python3 -m unittest discover -s tests -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 git diff --check
 ```
 
 自动测试使用临时目录验证上传、校验、日志管道及连接失败时的保护行为，
 以及云端清理的目录匹配和失败处理；这些测试模拟 Docker 和 WebDAV 操作。
+恢复入口另检查已有快照复用、非法路径及损坏数据库压缩文件拒绝、
+失败时不清理旧快照，以及不调用 Docker 或重建本地副本。
 第二块盘的测试使用真实 rsync，检查硬链接 inode 复用、旧文件内容保留、
 两份副本保留策略，以及部分同步失败时的旧副本保护。
 

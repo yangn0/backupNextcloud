@@ -7,7 +7,7 @@
 #   2. 排除可再生的缓存、缩略图、回收站、版本历史、日志
 #   3. 数据库用 mysqldump 单独导出（gzip 压缩）
 #   4. 通过 OpenList WebDAV 上传；网盘秒传由 OpenList 存储驱动处理
-#   5. 上传并发调低，降低峰值带宽，降低被运营商限速的风险
+#   5. 降低上传和检查并发，限制请求频率，缓解云盘 API 限流
 #   6. 新备份上传并校验成功后才清理主盘和云端旧备份
 #   7. 上传的逐文件输出单独归档到 full/，主日志只留关键行
 # =====================================================================
@@ -27,7 +27,9 @@ RCLONE=${RCLONE:-rclone}                         # WebDAV 客户端
 KEEP_DISK1T=2                                   # /home/yangn0/disk1T 保留的备份份数
 KEEP_DISK500G=2                                 # 第二块本地盘保留的备份份数（硬链接复用）
 KEEP_REMOTE=2                                   # 阿里云盘保留的备份份数
-UPLOAD_CONCURRENCY=10                           # WebDAV 上传并发数（路由器统一限速）
+UPLOAD_CONCURRENCY=${UPLOAD_CONCURRENCY:-2}     # 上传并发，降低阿里云盘 API 限流风险
+CHECK_CONCURRENCY=${CHECK_CONCURRENCY:-2}       # 目录读取和校验并发
+OPENLIST_TPSLIMIT=${OPENLIST_TPSLIMIT:-4}       # 每个 rclone 进程每秒最多请求数
 DB_CONTAINER=                                   # 留空则自动取 config.php 中的 dbhost
 INCLUDE_DATA=${INCLUDE_DATA:-1}                 # 1=备份 data；0=测试模式（跳过 data，且不清理旧备份）
 KEEP_LOGS=1                                     # 备份日志保留次数（与 logrotate.conf 的 rotate 一致）
@@ -65,7 +67,8 @@ openlist() {
   RCLONE_CONFIG_OPENLIST_USER="$OPENLIST_USER" \
   RCLONE_CONFIG_OPENLIST_PASS="$OPENLIST_PASS" \
     "$RCLONE" --config /dev/null --contimeout 30s --timeout 5m \
-      --retries 3 --low-level-retries 10 "$@"
+      --tpslimit "$OPENLIST_TPSLIMIT" --tpslimit-burst 1 \
+      --retries 3 --retries-sleep 30s --low-level-retries 10 "$@"
 }
 
 # 从 config.php 读取配置项（单引号字面量格式）
@@ -193,7 +196,65 @@ sync_second_copy() {
   done
 }
 
+# 上传和校验已有快照；仅主流程在成功后执行旧备份清理。
+upload_snapshot() {
+  # 6. 通过 OpenList 上传；秒传由存储驱动决定，WebDAV 本身仍会读取本地文件。
+  openlist mkdir "$REMOTE_SNAP" || fail "创建云端目录 $REMOTE_SNAP 失败"
+  log "开始通过 OpenList WebDAV 上传（并发 $UPLOAD_CONCURRENCY）..."
+  if mkdir -p "$FULL_LOG_DIR" 2>/dev/null; then
+    FULL_LOG="$FULL_LOG_DIR/backup-$startTime_s${RESUME_LOG_SUFFIX:-}.log"
+    log "逐文件详细输出: $FULL_LOG（备份结束后自动压缩归档）"
+  else
+    FULL_LOG=/dev/null
+    log "警告: 无法创建 $FULL_LOG_DIR，本次不保留逐文件详细日志"
+  fi
+
+  # 完整输出写进 FULL_LOG，主日志只保留 UPLOAD_FILTER 过滤后的关键行
+  openlist copy "$SNAP/" "$REMOTE_SNAP" \
+    --transfers "$UPLOAD_CONCURRENCY" --checkers "$CHECK_CONCURRENCY" \
+    --create-empty-src-dirs --log-level INFO --stats 1m --stats-one-line 2>&1 \
+    | tee "$FULL_LOG" \
+    | awk "$UPLOAD_FILTER"
+  UPLOAD_STATUS=("${PIPESTATUS[@]}")
+  for rc in "${UPLOAD_STATUS[@]}"; do
+    [ "$rc" -eq 0 ] || fail "上传或日志处理失败（管道退出码: ${UPLOAD_STATUS[*]}），保留全部旧备份，详细输出: $FULL_LOG"
+  done
+
+  # 7. 逐文件校验路径和大小；通用 WebDAV 不提供可靠的云端哈希。
+  log "校验云端所有文件的路径和大小 ..."
+  openlist check "$SNAP/" "$REMOTE_SNAP" --size-only \
+    --checkers "$CHECK_CONCURRENCY" 2>&1 | tee -a "$FULL_LOG"
+  CHECK_STATUS=("${PIPESTATUS[@]}")
+  for rc in "${CHECK_STATUS[@]}"; do
+    [ "$rc" -eq 0 ] || fail "上传校验或日志处理失败（管道退出码: ${CHECK_STATUS[*]}），保留全部旧备份"
+  done
+  log "云端文件校验通过"
+}
+
+# 复用已生成的快照，不开启维护模式、不重新导出数据库，也不清理旧备份。
+resume_snapshot() {
+  local timestamp=$1
+  [[ "$timestamp" =~ ^[0-9]+$ ]] || fail "快照时间戳只能包含数字"
+  startTime_s=$timestamp
+  SNAP="$BACKUP_DIR/nextcloud-$timestamp"
+  [ -d "$SNAP/data" ] && [ -d "$SNAP/config" ] && [ -s "$SNAP/db/nextcloud-db.sql.gz" ] \
+    || fail "已有快照缺少 data、config 或数据库导出: $SNAP"
+  gzip -t "$SNAP/db/nextcloud-db.sql.gz" || fail "数据库压缩文件损坏: $SNAP"
+  configure_openlist
+  REMOTE_SNAP="$REMOTE_ROOT/nextcloud-$timestamp"
+  RESUME_LOG_SUFFIX="-resume-$(date +%s)"
+  trap rotate_full_logs EXIT
+  log "===== 恢复上传已有快照: $SNAP ====="
+  upload_snapshot
+  log "===== 恢复上传及云端校验完成，保留全部旧备份 ====="
+}
+
 main() {
+  if [ "$#" -gt 0 ]; then
+    [ "$#" -eq 2 ] && [ "$1" = --resume ] || fail "用法: $0 [--resume <快照时间戳>]"
+    resume_snapshot "$2"
+    return
+  fi
   # 在进入维护模式或写入本地快照前检查 OpenList 登录和存储连通性。
   configure_openlist
   openlist lsf "openlist:${OPENLIST_MOUNT_PATH%/}" --dirs-only --max-depth 1 >/dev/null \
@@ -262,37 +323,7 @@ main() {
     sync_second_copy
   fi
 
-  # 6. 通过 OpenList 上传；秒传由存储驱动决定，WebDAV 本身仍会读取本地文件。
-  openlist mkdir "$REMOTE_SNAP" || fail "创建云端目录 $REMOTE_SNAP 失败"
-  log "开始通过 OpenList WebDAV 上传（并发 $UPLOAD_CONCURRENCY）..."
-  if mkdir -p "$FULL_LOG_DIR" 2>/dev/null; then
-    FULL_LOG="$FULL_LOG_DIR/backup-$startTime_s.log"
-    log "逐文件详细输出: $FULL_LOG（备份结束后自动压缩归档）"
-  else
-    FULL_LOG=/dev/null
-    log "警告: 无法创建 $FULL_LOG_DIR，本次不保留逐文件详细日志"
-  fi
-
-  # 完整输出写进 FULL_LOG，主日志只保留 UPLOAD_FILTER 过滤后的关键行
-  openlist copy "$SNAP/" "$REMOTE_SNAP" \
-    --transfers "$UPLOAD_CONCURRENCY" --checkers "$UPLOAD_CONCURRENCY" \
-    --create-empty-src-dirs --log-level INFO --stats 1m --stats-one-line 2>&1 \
-    | tee "$FULL_LOG" \
-    | awk "$UPLOAD_FILTER"
-  UPLOAD_STATUS=("${PIPESTATUS[@]}")
-  for rc in "${UPLOAD_STATUS[@]}"; do
-    [ "$rc" -eq 0 ] || fail "上传或日志处理失败（管道退出码: ${UPLOAD_STATUS[*]}），保留全部旧备份，详细输出: $FULL_LOG"
-  done
-
-  # 7. 逐文件校验路径和大小；通用 WebDAV 不提供可靠的云端哈希。
-  log "校验云端所有文件的路径和大小 ..."
-  openlist check "$SNAP/" "$REMOTE_SNAP" --size-only \
-    --checkers "$UPLOAD_CONCURRENCY" 2>&1 | tee -a "$FULL_LOG"
-  CHECK_STATUS=("${PIPESTATUS[@]}")
-  for rc in "${CHECK_STATUS[@]}"; do
-    [ "$rc" -eq 0 ] || fail "上传校验或日志处理失败（管道退出码: ${CHECK_STATUS[*]}），保留全部旧备份"
-  done
-  log "云端文件校验通过"
+  upload_snapshot
 
   # 8. 清理旧备份（仅在上传校验通过后执行）
   if [ "$INCLUDE_DATA" -eq 0 ]; then
